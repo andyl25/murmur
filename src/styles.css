@@ -1,0 +1,93 @@
+@import "./beautifui/foundation.css";
+
+:root {
+  --font-inter: "Inter";
+  --font-mono-face: "JetBrains Mono";
+}
+
+html,
+body,
+#root {
+  height: 100%;
+}
+
+/* The kit's striped body is a showcase backdrop; the app sits on the plain page tone. */
+body {
+  background: var(--page);
+  background-image: none;
+  overflow: hidden;
+}
+
+/* App styles live in a layer so the kit's Tailwind utilities always win. */
+@layer components {
+  .murmur-scroll {
+    scrollbar-width: thin;
+    scrollbar-color: var(--line-strong) transparent;
+  }
+
+  /* words that just arrived in the live transcript resolve out of a soft blur */
+  .live-new {
+    animation: murmur-word-in 240ms var(--ease-out-strong);
+  }
+
+  .bubble-live .stream-caret {
+    background: currentColor;
+    opacity: 0.9;
+  }
+
+  /* cleaned-up text replacing the raw transcript */
+  .bubble-swap {
+    animation: murmur-swap 320ms var(--ease-out-strong);
+  }
+
+  .typing-dot {
+    animation: murmur-bounce 1.1s ease-in-out infinite;
+  }
+
+  .toast-in {
+    animation: murmur-toast 220ms var(--ease-out-strong);
+  }
+}
+
+@keyframes murmur-word-in {
+  from {
+    opacity: 0;
+    filter: blur(3px);
+  }
+}
+
+@keyframes murmur-swap {
+  from {
+    opacity: 0.25;
+    filter: blur(2px);
+  }
+}
+
+@keyframes murmur-bounce {
+  0%,
+  60%,
+  100% {
+    transform: translateY(0);
+    opacity: 0.55;
+  }
+  30% {
+    transform: translateY(-3px);
+    opacity: 1;
+  }
+}
+
+@keyframes murmur-toast {
+  from {
+    opacity: 0;
+    transform: translateY(6px) scale(0.98);
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .live-new,
+  .bubble-swap,
+  .typing-dot,
+  .toast-in {
+    animation: none;
+  }
+}
