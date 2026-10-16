@@ -1,9 +1,10 @@
 import { ArrowUp, Check, Copy, Eye, Microphone, Sparks, Trash, WarningTriangle, Xmark } from 'iconoir-react';
+import { Pause, Play } from 'iconoir-react/solid';
 import { type ReactNode, useEffect, useLayoutEffect, useRef, useState } from 'react';
 import { Button } from '@/components/atoms/Button';
 import { Shimmer } from '@/components/atoms/Shimmer';
 import { cn } from '@/lib/utils';
-import { type Helper, type Live, type Message, OWNER_ID, onLevel, useMurmur } from './useMurmur';
+import { type Helper, type Live, type Message, onLevel, useMurmur } from './useMurmur';
 
 const GROUP_MS = 2 * 60_000; // bubbles closer than this stack as one group
 const DIVIDER_MS = 15 * 60_000; // a gap this long gets a time divider
@@ -12,46 +13,42 @@ export function App() {
   const m = useMurmur();
   const scroller = useRef<HTMLDivElement>(null);
   const stick = useRef(true);
+  const lives = Object.values(m.lives).sort((a, b) => a.startedAt - b.startedAt);
 
   useLayoutEffect(() => {
     const el = scroller.current;
     if (el && stick.current) el.scrollTop = el.scrollHeight;
-  }, [m.messages, m.live?.id, m.live?.text]);
+  }, [m.messages, m.lives]);
 
   const onScroll = () => {
     const el = scroller.current!;
     stick.current = el.scrollHeight - el.scrollTop - el.clientHeight < 96;
   };
 
-  const empty = m.ready && m.messages.length === 0 && !m.live;
+  const empty = m.ready && m.messages.length === 0 && !lives.length;
+  // whoever is on the other end: the host for guests, the most recent other speaker for the host
+  const other = m.owner ? m.helpers.find((h) => h.id !== m.myId)?.name ?? 'your friend' : m.hostName;
 
   return (
     <div className="flex h-full flex-col bg-page">
-      <Header {...m} />
-      {m.owner && <Notices helper={m.helper} online={m.online} />}
+      <Header {...m} liveList={lives} />
+      {(m.owner || m.myHelper) && <Notices helper={m.myHelper} owner={m.owner} online={m.online} />}
       <div ref={scroller} onScroll={onScroll} className="murmur-scroll flex-1 overflow-y-auto">
         <div className="mx-auto flex min-h-full max-w-[720px] flex-col px-4 pt-6 pb-4">
           {empty ? (
-            <EmptyState owner={m.owner} host={m.helper.name} />
+            <EmptyState canDictate={!!m.myHelper || m.owner} other={other} />
           ) : (
-            <Thread
-              messages={m.messages}
-              live={m.live}
-              owner={m.owner}
-              isMine={m.isMine}
-              onDelete={m.remove}
-            />
+            <Thread messages={m.messages} lives={lives} owner={m.owner} isMine={m.isMine} onDelete={m.remove} />
           )}
         </div>
       </div>
       {!m.ready ? null : !m.owner && !m.name ? (
-        <NameForm onSubmit={m.setName} host={m.helper.name} />
+        <NameForm onSubmit={m.setName} host={m.hostName} />
       ) : (
         <Composer
-          live={m.owner ? m.live : null}
-          owner={m.owner}
-          name={m.name}
-          canDictate={m.helper.connected}
+          live={m.myLive}
+          name={m.owner ? null : m.name}
+          canDictate={!!m.myHelper}
           onToggle={m.toggle}
           onCancel={m.cancel}
           onSend={m.sendText}
@@ -65,24 +62,29 @@ export function App() {
 
 // ---------------------------------------------------------------- header
 
-function Header(m: ReturnType<typeof useMurmur>) {
-  const fnReady = m.helper.connected && m.helper.info?.perms.input === 'granted';
-  const host = m.helper.name;
+function names(list: string[]) {
+  return list.length <= 2 ? list.join(' and ') : `${list.slice(0, -1).join(', ')} and ${list.at(-1)}`;
+}
+
+function Header(m: ReturnType<typeof useMurmur> & { liveList: Live[] }) {
+  const talking = m.liveList.filter((l) => l.senderId !== m.myId).map((l) => l.sender);
+  const online = m.helpers.filter((h) => h.id !== m.myId).map((h) => h.name);
+  const fnReady = m.myHelper?.info?.perms.input === 'granted';
   const [dot, status] = !m.online
     ? ['bg-ink-3', m.ready ? 'Reconnecting…' : 'Connecting…']
-    : !m.owner
-      ? m.live
-        ? ['bg-red', `${host} is talking…`]
-        : m.helper.connected
-          ? ['bg-green', `${host} is online`]
-          : ['bg-ink-3', `${host} is offline`]
-      : m.live
-        ? ['bg-red', 'Listening…']
-        : fnReady
-          ? ['bg-green', 'Press fn to talk']
-          : m.helper.connected
-            ? ['bg-orange', 'Waiting for Input Monitoring']
-            : ['bg-ink-3', 'Mac app not connected'];
+    : m.myLive
+      ? ['bg-red', 'Listening…']
+      : talking.length
+        ? ['bg-red', `${names(talking)} ${talking.length > 1 ? 'are' : 'is'} talking…`]
+        : m.myHelper && !fnReady
+          ? ['bg-orange', 'Waiting for Input Monitoring']
+          : online.length
+            ? ['bg-green', `${names(online)} ${online.length > 1 ? 'are' : 'is'} online`]
+            : m.myHelper
+              ? ['bg-green', 'Press fn to talk']
+              : m.owner
+                ? ['bg-ink-3', 'Mac app not connected']
+                : ['bg-ink-3', `${m.hostName} is offline`];
 
   return (
     <header className="border-b border-line">
@@ -93,7 +95,7 @@ function Header(m: ReturnType<typeof useMurmur>) {
         <div className="min-w-0 flex-1">
           <div className="text-[14px] leading-tight font-semibold">Murmur</div>
           <div className="flex items-center gap-1.5 text-[12px] text-ink-2">
-            <span className={cn('size-1.5 shrink-0 rounded-full', dot, m.live && 'animate-pulse')} />
+            <span className={cn('size-1.5 shrink-0 rounded-full', dot, dot === 'bg-red' && 'animate-pulse')} />
             <span className="truncate">{status}</span>
           </div>
         </div>
@@ -149,7 +151,7 @@ function Bars() {
 
 const FN_HINT_KEY = 'murmur.fnHintDismissed';
 
-function Notices({ helper, online }: { helper: Helper; online: boolean }) {
+function Notices({ helper, owner, online }: { helper: Helper | null; owner: boolean; online: boolean }) {
   const [fnDismissed, setFnDismissed] = useState(() => {
     try {
       return localStorage.getItem(FN_HINT_KEY) === '1';
@@ -160,16 +162,17 @@ function Notices({ helper, online }: { helper: Helper; online: boolean }) {
   if (!online) return null;
 
   const items: { key: string; text: ReactNode; dismiss?: () => void }[] = [];
-  const perms = helper.info?.perms;
-  if (!helper.connected) {
-    items.push({
-      key: 'helper',
-      text: (
-        <>
-          The fn-key helper isn’t running. Start it with <Code>npm run helper</Code>.
-        </>
-      ),
-    });
+  const perms = helper?.info?.perms;
+  if (!helper) {
+    if (owner)
+      items.push({
+        key: 'helper',
+        text: (
+          <>
+            Your Murmur Mac app isn’t connected. Open it from Applications, or build it with <Code>npm run helper</Code>.
+          </>
+        ),
+      });
   } else if (perms) {
     if (perms.input !== 'granted')
       items.push({
@@ -231,51 +234,47 @@ function Code({ children }: { children: ReactNode }) {
 
 function Thread({
   messages,
-  live,
+  lives,
   owner,
   isMine,
   onDelete,
 }: {
   messages: Message[];
-  live: Live | null;
+  lives: Live[];
   owner: boolean;
   isMine: (senderId: string) => boolean;
   onDelete: (id: string) => void;
 }) {
+  // sent messages, then whatever people are saying right now, as one stream for grouping
+  const items = [
+    ...messages.map((msg) => ({ kind: 'msg' as const, key: msg.id, senderId: msg.senderId, at: msg.createdAt, msg })),
+    ...lives.map((live) => ({ kind: 'live' as const, key: `live-${live.senderId}`, senderId: live.senderId, at: live.startedAt, live })),
+  ];
   const rows: ReactNode[] = [];
-  messages.forEach((msg, i) => {
-    const prev = messages[i - 1];
-    const divider = !prev || !sameDay(prev.createdAt, msg.createdAt) || msg.createdAt - prev.createdAt > DIVIDER_MS;
-    if (divider) rows.push(<Divider key={`d-${msg.id}`} t={msg.createdAt} />);
-    const joinedAbove = !divider && prev.senderId === msg.senderId && msg.createdAt - prev.createdAt < GROUP_MS;
-    // the live bubble always belongs to the host, so it can join the host's last message
-    const next = messages[i + 1] ?? (live && { senderId: OWNER_ID, createdAt: live.startedAt });
-    const joinedBelow =
-      !!next &&
-      next.senderId === msg.senderId &&
-      next.createdAt - msg.createdAt < GROUP_MS &&
-      sameDay(next.createdAt, msg.createdAt);
-    const mine = isMine(msg.senderId);
+  items.forEach((item, i) => {
+    const prev = items[i - 1];
+    const next = items[i + 1];
+    const divider = !prev || !sameDay(prev.at, item.at) || item.at - prev.at > DIVIDER_MS;
+    if (divider) rows.push(<Divider key={`d-${item.key}`} t={item.at} />);
+    const joinedAbove = !divider && prev.senderId === item.senderId && item.at - prev.at < GROUP_MS;
+    const joinedBelow = !!next && next.senderId === item.senderId && next.at - item.at < GROUP_MS && sameDay(next.at, item.at);
+    const mine = isMine(item.senderId);
     rows.push(
-      <Bubble
-        key={msg.id}
-        msg={msg}
-        mine={mine}
-        canDelete={owner || mine}
-        joinedAbove={joinedAbove}
-        joinedBelow={joinedBelow}
-        onDelete={onDelete}
-      />,
+      item.kind === 'msg' ? (
+        <Bubble
+          key={item.key}
+          msg={item.msg}
+          mine={mine}
+          canDelete={owner || mine}
+          joinedAbove={joinedAbove}
+          joinedBelow={joinedBelow}
+          onDelete={onDelete}
+        />
+      ) : (
+        <LiveBubble key={item.key} live={item.live} mine={mine} joinedAbove={joinedAbove} />
+      ),
     );
   });
-
-  if (live) {
-    const last = messages.at(-1);
-    const divider = !last || !sameDay(last.createdAt, live.startedAt) || live.startedAt - last.createdAt > DIVIDER_MS;
-    if (divider) rows.push(<Divider key="d-live" t={live.startedAt} />);
-    const joinedAbove = !divider && last.senderId === OWNER_ID && live.startedAt - last.createdAt < GROUP_MS;
-    rows.push(<LiveBubble key="live" live={live} mine={owner} joinedAbove={joinedAbove} />);
-  }
 
   return <div className="mt-auto flex flex-col gap-[3px]">{rows}</div>;
 }
@@ -363,13 +362,72 @@ function Bubble({
             </IconButton>
           )}
         </div>
-        <div className={cn(bubbleShape(mine, joinedAbove, joinedBelow), showRaw && edited && (mine ? 'bg-ink-2' : 'bg-line-strong'))}>
+        <div
+          className={cn(
+            bubbleShape(mine, joinedAbove, joinedBelow),
+            showRaw && edited && (mine ? 'bg-ink-2' : 'bg-line-strong'),
+            msg.audio && 'min-w-[230px]',
+          )}
+        >
+          {msg.audio && <VoicePlayer src={msg.audio} durationMs={msg.durationMs} mine={mine} />}
           <span key={text} className={text !== firstText.current ? 'bubble-swap' : undefined}>
             {text}
           </span>
         </div>
       </div>
       {meta && <div className="mx-1 mt-1 mb-0.5 text-[11.5px] text-ink-3">{meta}</div>}
+    </div>
+  );
+}
+
+let playingNow: HTMLAudioElement | null = null; // one voice message plays at a time
+
+/** ▶ for a voice message's recording: play/pause, progress, time left. */
+function VoicePlayer({ src, durationMs, mine }: { src: string; durationMs?: number; mine: boolean }) {
+  const audio = useRef<HTMLAudioElement | null>(null);
+  const [playing, setPlaying] = useState(false);
+  const [pos, setPos] = useState(0);
+  const [length, setLength] = useState((durationMs ?? 0) / 1000);
+
+  useEffect(() => () => audio.current?.pause(), []);
+
+  const toggle = () => {
+    let a = audio.current;
+    if (!a) {
+      a = new Audio(src);
+      a.onloadedmetadata = () => Number.isFinite(a!.duration) && setLength(a!.duration);
+      a.ontimeupdate = () => setPos(a!.currentTime);
+      a.onplay = () => setPlaying(true);
+      a.onpause = () => setPlaying(false);
+      a.onended = () => setPos(0);
+      audio.current = a;
+    }
+    if (!a.paused) return a.pause();
+    if (playingNow && playingNow !== a) playingNow.pause();
+    playingNow = a;
+    void a.play();
+  };
+
+  const pct = length ? Math.min(100, (pos / length) * 100) : 0;
+  return (
+    <div className="mb-1.5 flex items-center gap-2.5 pt-0.5">
+      <button
+        onClick={toggle}
+        aria-label={playing ? 'Pause' : 'Play recording'}
+        title={playing ? 'Pause' : 'Play recording'}
+        className={cn(
+          'grid size-7 shrink-0 place-items-center rounded-full transition-transform active:scale-95',
+          mine ? 'bg-white text-accent' : 'bg-ink text-canvas',
+        )}
+      >
+        {playing ? <Pause width={12} height={12} /> : <Play width={12} height={12} className="translate-x-[1px]" />}
+      </button>
+      <div className={cn('h-[3px] flex-1 overflow-hidden rounded-full', mine ? 'bg-white/30' : 'bg-ink/15')}>
+        <div className={cn('h-full rounded-full', mine ? 'bg-white' : 'bg-ink')} style={{ width: `${pct}%` }} />
+      </div>
+      <span className={cn('font-mono text-[11.5px] tabular-nums', mine ? 'text-white/80' : 'text-ink-2')}>
+        {clock(Math.max(0, length - pos) * 1000)}
+      </span>
     </div>
   );
 }
@@ -445,19 +503,19 @@ function TypingDots() {
   );
 }
 
-function EmptyState({ owner, host }: { owner: boolean; host: string }) {
+function EmptyState({ canDictate, other }: { canDictate: boolean; other: string }) {
   return (
     <div className="m-auto flex max-w-[340px] flex-col items-center pb-10 text-center">
       <kbd className="grid size-14 place-items-center rounded-[12px] bg-surface font-mono text-[17px] font-medium text-ink shadow-raised">
-        {owner ? 'fn' : <Bars />}
+        {canDictate ? 'fn' : <Bars />}
       </kbd>
       <h2 className="mt-5 text-[17px] font-semibold tracking-[-0.02em]">
-        {owner ? 'Press fn and start talking' : `Waiting for ${host}`}
+        {canDictate ? 'Press fn and start talking' : `Waiting for ${other}`}
       </h2>
       <p className="mt-1.5 text-[13.5px] leading-relaxed text-ink-2">
-        {owner
-          ? 'Your words show up here live as you speak. Press fn again and they’re sent as a message.'
-          : `When ${host} talks, their words appear here live as they speak. You can reply below.`}
+        {canDictate
+          ? 'Your words show up here live as you speak. Press fn again and they’re sent as a message anyone here can play back.'
+          : `When ${other} talks, their words appear here live as they speak. You can reply below.`}
       </p>
     </div>
   );
@@ -496,7 +554,6 @@ function NameForm({ host, onSubmit }: { host: string; onSubmit: (name: string) =
 
 function Composer({
   live,
-  owner,
   name,
   canDictate,
   onToggle,
@@ -505,8 +562,7 @@ function Composer({
   onRename,
 }: {
   live: Live | null;
-  owner: boolean;
-  name: string;
+  name: string | null; // a guest's chosen name (null for the host)
   canDictate: boolean;
   onToggle: () => void;
   onCancel: () => void;
@@ -548,14 +604,13 @@ function Composer({
               placeholder="Message"
               className="min-w-0 flex-1 bg-transparent text-[14.5px] outline-none placeholder:text-ink-3"
             />
-            {text.trim() || !owner ? (
+            {text.trim() || !canDictate ? (
               <SendButton label="Send" type="submit" disabled={!text.trim()} />
             ) : (
               <button
                 type="button"
-                title={canDictate ? 'Dictate (fn)' : 'Open the Murmur Mac app to dictate'}
+                title="Dictate (fn)"
                 aria-label="Dictate"
-                disabled={!canDictate}
                 onClick={onToggle}
                 className="grid size-8 place-items-center rounded-full text-ink-2 transition-colors hover:bg-hover-2 hover:text-ink disabled:opacity-40"
               >
@@ -565,7 +620,7 @@ function Composer({
           </form>
         )}
         <div className="mt-2 flex justify-center gap-3 text-[11.5px] text-ink-3">
-          {!owner ? (
+          {!canDictate && name ? (
             <span>
               Chatting as <span className="font-medium text-ink-2">{name}</span> ·{' '}
               <button className="underline-offset-2 hover:text-ink hover:underline" onClick={onRename}>
@@ -581,11 +636,11 @@ function Composer({
                 <Kbd>esc</Kbd> discard
               </span>
             </>
-          ) : (
+          ) : canDictate ? (
             <span>
               <Kbd>fn</Kbd> anywhere on your Mac to dictate
             </span>
-          )}
+          ) : null}
         </div>
       </div>
     </footer>

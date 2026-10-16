@@ -6,15 +6,17 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import Anthropic from '@anthropic-ai/sdk';
 import express from 'express';
-import { WebSocketServer, type WebSocket } from 'ws';
+import { type RawData, WebSocketServer, type WebSocket } from 'ws';
 
-// Murmur server: one hub between the host's fn/speech helper and every open chat tab.
-//   helper  ws /helper?token=…  → start / partial / final / cancel / level / hello
-//   browser ws /ws?owner=…      ← live transcript + messages;  → toggle / send / delete / clear / polish
+// Murmur server: one hub between everyone's fn/speech Mac app and every open chat tab.
+//   Mac app  ws /helper?token=…|key=…  → hello / start / partial / final / audio(+binary) / cancel / level
+//   browser  ws /ws?owner=…            ← live transcripts + messages;  → toggle / send / delete / clear / polish
 //
-// When MURMUR_HELPER_TOKEN is set (hosted), only a helper presenting it can dictate, and only
-// browsers opened with #owner=<token> (the helper's "Open Chat") can start the host's mic,
-// clear the chat or flip clean-up. Everyone else is a guest who picks a name and can type.
+// Identity: the host's Mac app presents MURMUR_HELPER_TOKEN and speaks as "owner"; anyone else's Mac
+// app presents its own random install key, which is also that person's id in the browser (the app's
+// "Open Chat" hands it over in the URL hash). A browser can only start/stop its own person's mic.
+// Only the owner can clear the chat or flip clean-up. With no token configured (local dev) every
+// Mac app is the owner.
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const PORT = Number(process.env.PORT ?? 5320);
@@ -22,8 +24,12 @@ const HOST = process.env.HOST ?? '127.0.0.1';
 const IS_PROD = process.env.NODE_ENV === 'production';
 const TOKEN = process.env.MURMUR_HELPER_TOKEN || '';
 const DATA_DIR = path.join(ROOT, 'data');
+const AUDIO_DIR = path.join(DATA_DIR, 'audio');
 const STORE = path.join(DATA_DIR, 'messages.json');
 const OWNER_ID = 'owner';
+// The bundle name the server is shipping, so pages left open across a deploy can reload themselves.
+const BUILD = IS_PROD ? (fs.readFileSync(path.join(ROOT, 'dist/index.html'), 'utf8').match(/assets\/index-[\w-]+\.js/)?.[0] ?? null) : null;
+const ID_RE = /^[A-Za-z0-9-]{8,64}$/;
 
 // ---------------------------------------------------------------- types
 
@@ -33,9 +39,10 @@ export type Message = {
   raw: string; // exactly what the recognizer heard
   source: 'voice' | 'typed';
   sender: string; // display name
-  senderId: string; // 'owner' for the host, else the guest browser's random id
+  senderId: string; // 'owner' for the host, else that person's install key / browser id
   createdAt: number;
   durationMs?: number;
+  audio?: string; // URL of the recording, for voice messages
   polish?: 'pending' | 'done' | 'failed';
 };
 
@@ -45,7 +52,9 @@ type HelperInfo = {
   perms: { mic: string; speech: string; input: string };
 };
 
-type Live = { id: string; text: string; startedAt: number; sender: string };
+type Live = { id: string; text: string; startedAt: number; sender: string; senderId: string };
+
+type Helper = { ws: WebSocket; id: string; name: string; info: HelperInfo | null };
 
 // ---------------------------------------------------------------- state
 
@@ -75,9 +84,8 @@ function save() {
   }, 150);
 }
 
-let live: Live | null = null;
-let helper: WebSocket | null = null;
-let helperInfo: HelperInfo | null = null;
+const helpers = new Map<string, Helper>(); // by person id
+const lives = new Map<string, Live>(); // by person id: what each person is saying right now
 
 // ---------------------------------------------------------------- claude polish
 
@@ -151,17 +159,19 @@ function broadcast(msg: object) {
   for (const c of browsers) if (c.ws.readyState === c.ws.OPEN) c.ws.send(data);
 }
 
-function helperState() {
-  return { connected: !!helper, info: helperInfo, name: store.hostName };
+function helperList() {
+  return [...helpers.values()].map((h) => ({ id: h.id, name: h.name, info: h.info }));
 }
 
 function snapshot(owner: boolean) {
   return {
     t: 'init',
+    build: BUILD,
     owner,
     messages: store.messages,
-    live,
-    helper: helperState(),
+    lives: [...lives.values()],
+    helpers: helperList(),
+    hostName: store.hostName,
     polish: store.polish,
     polishAvailable: !!claude,
   };
@@ -175,89 +185,105 @@ function clean(s: unknown, max: number) {
   return String(s ?? '').trim().slice(0, max);
 }
 
-function addMessage(m: Message, endLive = false) {
+function addMessage(m: Message, endLiveOf?: string) {
   store.messages.push(m);
-  if (store.messages.length > 2000) store.messages.splice(0, store.messages.length - 2000);
+  if (store.messages.length > 2000) for (const old of store.messages.splice(0, store.messages.length - 2000)) dropAudio(old);
   save();
-  // endLive swaps the live bubble for the sent one in a single render
-  broadcast({ t: 'message', message: m, endLive });
+  // endLive swaps that person's live bubble for the sent one in a single render
+  broadcast({ t: 'message', message: m, endLive: endLiveOf });
   if (m.source === 'voice' && store.polish && claude && m.raw.split(/\s+/).length >= 3) void polishMessage(m);
 }
 
-function onHelperMessage(msg: any) {
+function dropAudio(m: Message) {
+  if (m.audio) fs.rm(path.join(AUDIO_DIR, `${m.id}.m4a`), { force: true }, () => {});
+}
+
+function setLive(personId: string, live: Live | null) {
+  if (live) lives.set(personId, live);
+  else lives.delete(personId);
+  broadcast({ t: 'live', senderId: personId, live });
+}
+
+function onHelperMessage(h: Helper, msg: any) {
   switch (msg.t) {
     case 'hello':
-      helperInfo = { fnUsage: msg.fnUsage ?? null, onDevice: !!msg.onDevice, perms: msg.perms };
-      if (msg.name) {
-        store.hostName = clean(msg.name, 40) || store.hostName;
+      h.info = { fnUsage: msg.fnUsage ?? null, onDevice: !!msg.onDevice, perms: msg.perms };
+      if (msg.name) h.name = clean(msg.name, 40) || h.name;
+      if (h.id === OWNER_ID && h.name !== store.hostName) {
+        store.hostName = h.name;
         save();
       }
-      broadcast({ t: 'helper', ...helperState() });
+      broadcast({ t: 'helpers', helpers: helperList(), hostName: store.hostName });
       break;
     case 'start':
-      live = { id: String(msg.id), text: '', startedAt: Date.now(), sender: store.hostName };
-      broadcast({ t: 'live', live });
+      setLive(h.id, { id: String(msg.id), text: '', startedAt: Date.now(), sender: h.name, senderId: h.id });
       break;
-    case 'partial':
-      if (!live || live.id !== String(msg.id)) live = { id: String(msg.id), text: '', startedAt: Date.now(), sender: store.hostName };
+    case 'partial': {
+      const live = lives.get(h.id) ?? { id: String(msg.id), text: '', startedAt: Date.now(), sender: h.name, senderId: h.id };
       live.text = clean(msg.text, 20000);
-      broadcast({ t: 'live', live });
+      setLive(h.id, live);
       break;
+    }
     case 'level':
-      broadcast({ t: 'level', v: Number(msg.v) || 0 });
+      broadcast({ t: 'level', id: h.id, v: Number(msg.v) || 0 });
       break;
     case 'final': {
       const text = clean(msg.text, 20000);
-      const started = live?.startedAt ?? Date.now();
-      live = null;
-      if (text)
-        addMessage(
-          {
-            id: newId(),
-            text,
-            raw: text,
-            source: 'voice',
-            sender: store.hostName,
-            senderId: OWNER_ID,
-            createdAt: started,
-            durationMs: Date.now() - started,
-          },
-          true,
-        );
-      else broadcast({ t: 'live', live: null });
+      const started = lives.get(h.id)?.startedAt ?? Date.now();
+      lives.delete(h.id);
+      if (!text) return setLive(h.id, null);
+      // the recording id becomes the message id, so the audio that follows can find it
+      const rid = String(msg.id ?? '');
+      const id = ID_RE.test(rid) && !store.messages.some((m) => m.id === rid) ? rid : newId();
+      addMessage(
+        { id, text, raw: text, source: 'voice', sender: h.name, senderId: h.id, createdAt: started, durationMs: Date.now() - started },
+        h.id,
+      );
       break;
     }
     case 'cancel':
-      live = null;
-      broadcast({ t: 'live', live: null });
+      setLive(h.id, null);
       break;
     case 'error':
-      console.warn('helper error:', msg.message);
-      broadcast({ t: 'notice', text: String(msg.message ?? 'Dictation error'), ownerOnly: true });
+      console.warn(`helper ${h.name} error:`, msg.message);
+      broadcast({ t: 'notice', text: String(msg.message ?? 'Dictation error'), to: h.id });
       break;
   }
 }
 
+/** A recording arrives as {t:'audio', id} then one binary frame with the .m4a bytes. */
+function onHelperAudio(h: Helper, messageId: string, data: Buffer) {
+  const m = store.messages.find((x) => x.id === messageId);
+  if (!m || m.senderId !== h.id || m.source !== 'voice' || !data.length) return;
+  fs.mkdirSync(AUDIO_DIR, { recursive: true });
+  fs.writeFileSync(path.join(AUDIO_DIR, `${m.id}.m4a`), data);
+  m.audio = `/audio/${m.id}.m4a`;
+  save();
+  broadcast({ t: 'update', message: m });
+}
+
 function onBrowserMessage(c: Client, msg: any) {
+  // the browser's person: the owner, or the id the guest's Mac app (or browser) gave it
+  const me = c.owner ? OWNER_ID : clean(msg.clientId, 64);
   switch (msg.t) {
     case 'toggle':
-    case 'cancel':
-      if (!c.owner) return;
-      if (helper?.readyState === helper?.OPEN) helper!.send(JSON.stringify({ t: msg.t }));
-      else c.ws.send(JSON.stringify({ t: 'notice', text: 'The Murmur Mac app isn’t connected.' }));
+    case 'cancel': {
+      const h = helpers.get(me);
+      if (h?.ws.readyState === h?.ws.OPEN) h!.ws.send(JSON.stringify({ t: msg.t }));
+      else c.ws.send(JSON.stringify({ t: 'notice', text: 'Your Murmur Mac app isn’t connected.' }));
       break;
+    }
     case 'send': {
       const text = clean(msg.text, 4000);
-      if (!text) return;
+      if (!text || !me) return;
       const sender = c.owner ? store.hostName : clean(msg.name, 40) || 'Guest';
-      const senderId = c.owner ? OWNER_ID : clean(msg.clientId, 64) || 'guest';
-      addMessage({ id: newId(), text, raw: text, source: 'typed', sender, senderId, createdAt: Date.now() });
+      addMessage({ id: newId(), text, raw: text, source: 'typed', sender, senderId: me, createdAt: Date.now() });
       break;
     }
     case 'delete': {
       const m = store.messages.find((x) => x.id === msg.id);
-      if (!m) return;
-      if (!c.owner && m.senderId !== clean(msg.clientId, 64)) return;
+      if (!m || (!c.owner && m.senderId !== me)) return;
+      dropAudio(m);
       store.messages = store.messages.filter((x) => x.id !== msg.id);
       save();
       broadcast({ t: 'delete', id: msg.id });
@@ -265,6 +291,7 @@ function onBrowserMessage(c: Client, msg: any) {
     }
     case 'clear':
       if (!c.owner) return;
+      store.messages.forEach(dropAudio);
       store.messages = [];
       save();
       broadcast({ t: 'clear' });
@@ -291,21 +318,25 @@ function tokenOk(given: string | null) {
 const app = express();
 app.get('/api/status', (_req, res) =>
   res.json({
-    connected: !!helper,
-    live: !!live,
+    speakers: helpers.size,
+    connected: helpers.has(OWNER_ID),
+    live: lives.size > 0,
     messages: store.messages.length,
     polish: store.polish,
     polishAvailable: !!claude,
   }),
 );
+app.use('/audio', express.static(AUDIO_DIR, { maxAge: '1d', fallthrough: false }));
 
 const server = http.createServer(app);
 const wss = new WebSocketServer({ noServer: true, maxPayload: 256 * 1024 });
+const helperWss = new WebSocketServer({ noServer: true, maxPayload: 25 * 1024 * 1024 }); // recordings
 
-function onJson(ws: WebSocket, fn: (msg: any) => void) {
-  ws.on('message', (raw) => {
+function onFrames(ws: WebSocket, onText: (msg: any) => void, onBinary?: (data: Buffer) => void) {
+  ws.on('message', (raw: RawData, isBinary: boolean) => {
+    if (isBinary) return onBinary?.(Buffer.isBuffer(raw) ? raw : Buffer.concat(raw as Buffer[]));
     try {
-      fn(JSON.parse(String(raw)));
+      onText(JSON.parse(String(raw)));
     } catch {
       /* ignore malformed */
     }
@@ -315,30 +346,38 @@ function onJson(ws: WebSocket, fn: (msg: any) => void) {
 server.on('upgrade', (req, socket, head) => {
   const url = new URL(req.url ?? '/', 'http://local');
   if (url.pathname === '/helper') {
-    if (!tokenOk(url.searchParams.get('token'))) {
+    const token = url.searchParams.get('token');
+    const installKey = url.searchParams.get('key') ?? '';
+    const id = token && tokenOk(token) ? OWNER_ID : !TOKEN ? OWNER_ID : ID_RE.test(installKey) ? installKey : '';
+    if (!id) {
       socket.write('HTTP/1.1 401 Unauthorized\r\n\r\n');
       socket.destroy();
       return;
     }
-    wss.handleUpgrade(req, socket, head, (ws) => {
+    helperWss.handleUpgrade(req, socket, head, (ws) => {
+      const name = clean(url.searchParams.get('name'), 40) || (id === OWNER_ID ? store.hostName : 'Guest');
+      const h: Helper = { ws, id, name, info: null };
+      let audioFor = '';
+      const onBinary = (data: Buffer) => {
+        if (audioFor) onHelperAudio(h, audioFor, data);
+        audioFor = '';
+      };
+      const onText = (msg: any) => (msg.t === 'audio' ? (audioFor = clean(msg.id, 64)) : onHelperMessage(h, msg));
+
       if (url.searchParams.get('role') === 'feed') {
-        // test instance (Murmur --feed file): its transcript shows up, but it never replaces the real helper
-        onJson(ws, (msg) => msg.t !== 'hello' && onHelperMessage(msg));
+        // test instance (Murmur --feed file): its transcript shows up, but it never replaces the real Mac app
+        onFrames(ws, (msg) => msg.t !== 'hello' && onText(msg), onBinary);
         return;
       }
-      helper?.close();
-      helper = ws;
-      broadcast({ t: 'helper', ...helperState() });
-      onJson(ws, onHelperMessage);
+      helpers.get(id)?.ws.close(); // same person reconnecting
+      helpers.set(id, h);
+      broadcast({ t: 'helpers', helpers: helperList(), hostName: store.hostName });
+      onFrames(ws, onText, onBinary);
       ws.on('close', () => {
-        if (helper !== ws) return;
-        helper = null;
-        helperInfo = null;
-        if (live) {
-          live = null;
-          broadcast({ t: 'live', live: null });
-        }
-        broadcast({ t: 'helper', ...helperState() });
+        if (helpers.get(id) !== h) return;
+        helpers.delete(id);
+        if (lives.has(id)) setLive(id, null);
+        broadcast({ t: 'helpers', helpers: helperList(), hostName: store.hostName });
       });
     });
   } else if (url.pathname === '/ws') {
@@ -346,7 +385,7 @@ server.on('upgrade', (req, socket, head) => {
       const c: Client = { ws, owner: tokenOk(url.searchParams.get('owner')) };
       browsers.add(c);
       ws.send(JSON.stringify(snapshot(c.owner)));
-      onJson(ws, (msg) => onBrowserMessage(c, msg));
+      onFrames(ws, (msg) => onBrowserMessage(c, msg));
       ws.on('close', () => browsers.delete(c));
     });
   }
@@ -379,6 +418,6 @@ server.on('error', (e: NodeJS.ErrnoException) => {
 });
 server.listen(PORT, HOST, () => {
   console.log(
-    `Murmur on http://${HOST}:${PORT}  (cleanup ${claude ? 'on' : 'off: no ANTHROPIC_API_KEY'}; helper token ${TOKEN ? 'required' : 'not set — local mode'})`,
+    `Murmur on http://${HOST}:${PORT}  (cleanup ${claude ? 'on' : 'off: no ANTHROPIC_API_KEY'}; helper token ${TOKEN ? 'required for the host' : 'not set — local mode'})`,
   );
 });

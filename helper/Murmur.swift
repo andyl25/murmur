@@ -2,7 +2,8 @@
 //
 // fn (tap)  → start listening; fn again → stop and send.  Esc while listening → discard.
 // Speech is recognized live (on-device when the Mac has the model) and streamed to the
-// Murmur server over ws://…/helper, which fans it out to the chat web app.
+// Murmur server over ws://…/helper, which fans it out to the chat web app. The audio is recorded
+// at the same time and uploaded with the message, so people in the chat can play it back.
 //
 // Test hook: `Murmur --feed <audio file>` plays a file through the same recognizer
 // instead of the mic (no fn tap, no pill, no sounds), sends it as one message, then quits.
@@ -11,14 +12,21 @@ import AVFoundation
 import AppKit
 import Speech
 
-// Where messages go. Point it at a hosted server with:
-//   defaults write com.andylee.murmur serverURL https://copose.ai
-//   defaults write com.andylee.murmur helperToken <token>     (must match MURMUR_HELPER_TOKEN)
-//   defaults write com.andylee.murmur displayName Andy        (optional; defaults to your first name)
+// Where messages go: the shared chat at copose.ai unless told otherwise.
+//   defaults write com.andylee.murmur serverURL http://127.0.0.1:5320   (your own local server)
+//   defaults write com.andylee.murmur displayName Sam                    (defaults to your first name)
+//   defaults write com.andylee.murmur helperToken <token>                (the host only; = MURMUR_HELPER_TOKEN)
 let settings = UserDefaults.standard
 let serverBase = (settings.string(forKey: "serverURL") ?? ProcessInfo.processInfo.environment["MURMUR_URL"]
-    ?? "http://127.0.0.1:5320").trimmingCharacters(in: CharacterSet(charactersIn: "/"))
+    ?? "https://copose.ai").trimmingCharacters(in: CharacterSet(charactersIn: "/"))
 let helperToken = settings.string(forKey: "helperToken") ?? ""
+/// This install's identity in the chat (also handed to the browser by Open Chat).
+let installKey: String = {
+    if let k = settings.string(forKey: "installKey"), !k.isEmpty { return k }
+    let k = UUID().uuidString
+    settings.set(k, forKey: "installKey")
+    return k
+}()
 let displayName = settings.string(forKey: "displayName")
     ?? NSFullUserName().split(separator: " ").first.map(String.init) ?? "Me"
 
@@ -45,7 +53,8 @@ final class Link {
 
     func connect() {
         let url = URL(string: serverBase.replacingOccurrences(of: "http", with: "ws")
-            + "/helper?role=" + role + "&token=" + query(helperToken))!
+            + "/helper?role=" + role + "&token=" + query(helperToken)
+            + "&key=" + query(installKey) + "&name=" + query(displayName))!
         let t = session.webSocketTask(with: url)
         task = t
         t.resume()
@@ -89,6 +98,11 @@ final class Link {
             onStatus?(false)
         }
         DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) { [weak self] in self?.connect() }
+    }
+
+    func sendData(_ data: Data) {
+        guard connected, let task else { return }
+        task.send(.data(data)) { _ in }
     }
 
     func send(_ obj: [String: Any]) {
@@ -187,6 +201,42 @@ final class Dictation {
     var onDevice: Bool { recognizer.supportsOnDeviceRecognition }
     var text: String { join(committed, current) }
 
+    // The recording people can play back: AAC in a temp .m4a, written from the same buffers
+    // the recognizer hears. Guarded by requestLock (written on the audio thread).
+    private var recorder: AVAudioFile?
+    private var recordingURL: URL?
+
+    private func openRecorder(_ format: AVAudioFormat) {
+        _ = takeRecording()
+        guard format.channelCount <= 2 else { return }
+        let url = FileManager.default.temporaryDirectory.appendingPathComponent("murmur-\(UUID().uuidString).m4a")
+        let fileSettings: [String: Any] = [
+            AVFormatIDKey: kAudioFormatMPEG4AAC,
+            AVSampleRateKey: format.sampleRate,
+            AVNumberOfChannelsKey: format.channelCount,
+            AVEncoderAudioQualityKey: AVAudioQuality.medium.rawValue,
+        ]
+        guard let file = try? AVAudioFile(forWriting: url, settings: fileSettings,
+                                          commonFormat: format.commonFormat, interleaved: format.isInterleaved)
+        else { return log("couldn't start recording audio") }
+        requestLock.lock()
+        recorder = file
+        recordingURL = url
+        requestLock.unlock()
+    }
+
+    /// Finishes the recording and returns its bytes (nil when there is none).
+    func takeRecording() -> Data? {
+        requestLock.lock()
+        let url = recordingURL
+        recorder = nil // releasing the AVAudioFile finalizes the .m4a
+        recordingURL = nil
+        requestLock.unlock()
+        guard let url else { return nil }
+        defer { try? FileManager.default.removeItem(at: url) }
+        return try? Data(contentsOf: url)
+    }
+
     /// Start from the microphone.
     func start() throws {
         reset()
@@ -196,6 +246,7 @@ final class Dictation {
         guard format.sampleRate > 0, format.channelCount > 0 else {
             throw NSError(domain: "Murmur", code: 1, userInfo: [NSLocalizedDescriptionKey: "No microphone input available"])
         }
+        openRecorder(format)
         input.installTap(onBus: 0, bufferSize: 1024, format: format) { [weak self] buffer, _ in
             self?.append(buffer)
         }
@@ -209,6 +260,7 @@ final class Dictation {
     func startFeeding(_ url: URL, done: @escaping () -> Void) throws {
         reset()
         let file = try AVAudioFile(forReading: url)
+        openRecorder(file.processingFormat)
         active = true
         feeding = true
         beginTask()
@@ -228,6 +280,7 @@ final class Dictation {
     private func append(_ buffer: AVAudioPCMBuffer) {
         requestLock.lock()
         request?.append(buffer)
+        try? recorder?.write(from: buffer)
         requestLock.unlock()
         guard let ch = buffer.floatChannelData?[0], buffer.frameLength > 0 else { return }
         var sum: Float = 0
@@ -357,6 +410,7 @@ final class Dictation {
         requestLock.lock()
         request = nil
         requestLock.unlock()
+        _ = takeRecording()
         session += 1
     }
 }
@@ -587,7 +641,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         pill.hide()
         play("Pop")
         updateIcon()
-        dictation.stop { [weak self] text in self?.link.send(["t": "final", "id": id, "text": text]) }
+        dictation.stop { [weak self] text in self?.sendFinal(id: id, text: text) }
+    }
+
+    /// Sends the finished transcript, then its recording ({t:"audio"} + one binary frame) so the
+    /// chat can play it back. Returns the audio size for logging.
+    @discardableResult
+    func sendFinal(id: String, text: String) -> Int {
+        let audio = dictation.takeRecording()
+        link.send(["t": "final", "id": id, "text": text])
+        guard !text.isEmpty, let audio, !audio.isEmpty else { return 0 }
+        link.send(["t": "audio", "id": id])
+        link.sendData(audio)
+        return audio.count
     }
 
     func cancel() {
@@ -622,9 +688,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 guard let self else { return }
                 self.recordingID = nil
                 self.dictation.stop { text in
-                    self.link.send(["t": "final", "id": id, "text": text])
-                    log("feed final: \(text)")
-                    DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { NSApp.terminate(nil) }
+                    let bytes = self.sendFinal(id: id, text: text)
+                    log("feed final: \(text) (audio \(bytes) bytes)")
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 2) { NSApp.terminate(nil) }
                 }
             }
         } catch {
@@ -673,9 +739,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         menu.addItem(withTitle: "Quit Murmur", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q")
     }
 
-    // #owner=<token> marks this browser as the host's, so it can start/stop dictation from the page.
+    // The host's token, or this install's key + name, tells the page whose mic and messages are "mine".
     @objc func openChat() {
-        let suffix = helperToken.isEmpty ? "" : "/#owner=" + query(helperToken)
+        let suffix = helperToken.isEmpty
+            ? "/#key=" + query(installKey) + "&name=" + query(displayName)
+            : "/#owner=" + query(helperToken)
         NSWorkspace.shared.open(URL(string: serverBase + suffix)!)
     }
     @objc func toggleFromMenu() { toggle() }

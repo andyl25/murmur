@@ -1,51 +1,61 @@
 # Murmur
 
-Wispr Flow–style dictation into a chat window. Tap **fn** anywhere on your Mac, talk, and your words stream live into a messaging-style web app; tap **fn** again to send. **Esc** discards.
+Wispr Flow–style voice chat. Tap **fn** anywhere on your Mac and talk: your words stream live into a shared chat at **https://copose.ai** as you speak. Tap **fn** again to send. **Esc** discards. Every voice message also keeps its recording, so anyone in the chat can tap ▶ to hear it.
 
 ```
-fn ─▶ Murmur.app (menu bar)            server (localhost:5320)            web app
-      CGEventTap hears fn               ws /helper ─▶ hub ─▶ ws /ws        live bubble grows as you talk,
-      AVAudioEngine → SFSpeechRecognizer  (start/partial/final/level)      becomes a sent message on stop
-      on-device, live partials           saves data/messages.json          optional Claude clean-up
+fn ─▶ Murmur.app (menu bar)             server (copose.ai)                      web chat
+      CGEventTap hears fn                ws /helper ─▶ hub ─▶ ws /ws             live bubble per speaker,
+      AVAudioEngine → SFSpeechRecognizer   one Mac app per person                 sent message with ▶ audio,
+      on-device, live partials + .m4a     stores messages + recordings           optional Claude clean-up
 ```
 
-## Run it on your own Mac
+## Talk in the chat from your Mac
 
-You need macOS 13 or newer, [Node.js](https://nodejs.org) 20 or newer, and Apple's command-line tools. If you don't have the command-line tools, run `xcode-select --install` once.
+You need macOS 13 or newer, git, and Apple's command-line tools. If you don't have the command-line tools, run `xcode-select --install` once.
 
 ```bash
 git clone https://github.com/andyl25/murmur.git
 cd murmur
-npm install
-npm run dev        # leave this running: chat server + web app on http://localhost:5320
+bash helper/build.sh && open /Applications/Murmur.app
 ```
 
-In a second Terminal tab, in the same folder:
-
-```bash
-npm run helper     # builds Murmur.app, installs it in /Applications and opens it
-```
-
-A waveform icon appears in your menu bar. Murmur has no window or Dock icon. Then:
+This builds the Murmur Mac app on your machine, installs it in Applications and opens it. You don't need Node or anything else. A waveform icon appears in your menu bar; Murmur has no window or Dock icon. Then:
 
 1. **Allow Microphone and Speech Recognition** when macOS asks.
 2. **Turn on Input Monitoring:** go to System Settings › Privacy & Security › **Input Monitoring** and switch **Murmur** on. Without this, fn does nothing. If macOS offers *Quit & Reopen*, click it.
 3. **Stop fn opening the emoji picker** (optional): System Settings › Keyboard › "Press 🌐 key to" → **Do Nothing**.
-4. **Open the chat:** click the menu-bar icon › **Open Chat**. Tap **fn**, talk, then tap **fn** again to send. **Esc** discards.
+4. **Open the chat:** click the menu-bar icon › **Open Chat**. Always open it this way: it tells the page which messages and mic are yours. Then tap **fn**, talk, and tap **fn** again to send.
+
+Your name in the chat is your Mac's first name. To change it, run this and then quit and reopen Murmur:
+
+```bash
+defaults write com.andylee.murmur displayName "Your Name"
+```
+
+Speech recognition runs on your Mac. Only the text and the recording of each message you send go to the chat, and the chat is public to anyone with the link.
+
+## Run your own private copy instead
+
+To run the whole thing locally, with your own chat on http://localhost:5320, you also need [Node.js](https://nodejs.org) 20 or newer:
+
+```bash
+npm install
+npm run dev                                                         # chat server + web app
+defaults write com.andylee.murmur serverURL http://127.0.0.1:5320   # point your Mac app at it
+npm run helper                                                      # (re)build and open the Mac app
+```
 
 **Optional clean-up** (Claude removes "um"s and applies corrections like "at 7, no wait, 8" → "at 8"): put `ANTHROPIC_API_KEY=sk-ant-…` in a `.env` file in this folder and restart `npm run dev`.
 
-Each person's copy is fully local, with its own chat. Speech recognition runs on your Mac.
-
-The helper is signed with your Apple Development certificate if you have one, so rebuilding keeps the permissions. Otherwise it's signed ad-hoc, and macOS asks for permissions again after each rebuild.
+The Mac app is signed with your Apple Development certificate if you have one, so rebuilding keeps the permissions. Otherwise it's signed ad-hoc, and macOS asks for permissions again after each rebuild.
 
 ## How copose.ai is hosted (maintainer notes)
 
 Murmur runs on an AWS Lightsail box (`murmur-chat`, us-east-1, static IP `23.21.240.217`, about $5/mo). It's Ubuntu with Node 22, Caddy for automatic HTTPS, and a systemd unit called `murmur`. GoDaddy's A record for `@` points at that IP, and `www` redirects to the bare domain.
 
 - **Deploy changes:** `bash scripts/deploy.sh` builds the web app, bundles the server into one file, uploads both and restarts. SSH key: `~/.ssh/murmur_lightsail`.
-- **Who can do what:** the Mac app has to present the helper token (`~/.murmur/helper-token`, which is also in `/opt/murmur/murmur.env` on the box). Its **Open Chat** menu item opens the site as the owner (`#owner=<token>`), who can start and stop the mic from the page, toggle clean-up and clear the chat. Everyone else is a guest: they pick a name, watch you talk live and can type replies.
-- **Mac app target:** `defaults write com.andylee.murmur serverURL https://copose.ai`. Set it to `http://127.0.0.1:5320` for local dev.
+- **Who can do what:** the host's Mac app presents the helper token (`~/.murmur/helper-token`, set with `defaults write com.andylee.murmur helperToken …`; also in `/opt/murmur/murmur.env` on the box) and speaks as the owner. Only the owner can clear the chat or toggle clean-up. Everyone else's Mac app joins with its own random install key, which **Open Chat** hands to their browser (`#key=…&name=…`), so each person controls only their own mic. Visitors without the Mac app pick a name and type. Recordings are stored in `/opt/murmur/data/audio`.
+- **Mac app target:** copose.ai by default. For local dev, run `defaults write com.andylee.murmur serverURL http://127.0.0.1:5320`; to go back, `defaults delete com.andylee.murmur serverURL`.
 - **Turn on clean-up on the server** (copies the key from your `.env`, never printed):
   ```bash
   grep '^ANTHROPIC_API_KEY=' ~/Documents/.env | ssh -i ~/.ssh/murmur_lightsail ubuntu@23.21.240.217 'sudo tee /opt/murmur/.env >/dev/null && sudo chown murmur:murmur /opt/murmur/.env && sudo chmod 600 /opt/murmur/.env && sudo systemctl restart murmur'

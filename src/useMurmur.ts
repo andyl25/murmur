@@ -9,14 +9,16 @@ export type Message = {
   senderId: string;
   createdAt: number;
   durationMs?: number;
+  audio?: string;
   polish?: 'pending' | 'done' | 'failed';
 };
 
-export type Live = { id: string; text: string; startedAt: number; sender: string };
+export type Live = { id: string; text: string; startedAt: number; sender: string; senderId: string };
 
+/** A connected Murmur Mac app — one per person who can talk. */
 export type Helper = {
-  connected: boolean;
-  name: string; // the host's display name (whoever runs the Mac app)
+  id: string;
+  name: string;
   info: {
     fnUsage: number | null;
     onDevice: boolean;
@@ -29,8 +31,9 @@ type State = {
   online: boolean;
   owner: boolean;
   messages: Message[];
-  live: Live | null;
-  helper: Helper;
+  lives: Record<string, Live>;
+  helpers: Helper[];
+  hostName: string;
   polish: boolean;
   polishAvailable: boolean;
   notice: string | null;
@@ -55,15 +58,19 @@ function write(key: string, value: string) {
   }
 }
 
-// The Mac app opens the chat as …/#owner=<token>; keep it and tidy the URL so it isn't shared by accident.
-function ownerToken() {
-  const m = location.hash.match(/owner=([^&]+)/);
-  if (m) {
-    write('murmur.owner', decodeURIComponent(m[1]));
-    history.replaceState(null, '', location.pathname + location.search);
-  }
-  return read('murmur.owner') ?? '';
+// The Mac app's "Open Chat" hands over who this browser is: #owner=<token> for the host,
+// #key=<install key>&name=<name> for everyone else. Keep it and tidy the URL so it isn't shared.
+function adoptHash() {
+  const params = new URLSearchParams(location.hash.slice(1));
+  const owner = params.get('owner');
+  const key = params.get('key');
+  const name = params.get('name');
+  if (owner) write('murmur.owner', owner);
+  if (key) write('murmur.clientId', key);
+  if (name) write('murmur.name', name);
+  if (owner || key) history.replaceState(null, '', location.pathname + location.search);
 }
+adoptHash();
 
 const clientId =
   read('murmur.clientId') ??
@@ -75,20 +82,33 @@ const clientId =
 
 export const OWNER_ID = 'owner';
 
+/** True when the server now ships a different bundle than this page runs (once per build, so it can't loop). */
+function staleBuild(build: string | null) {
+  if (!build || document.querySelector(`script[src$="${build.split('/').pop()}"]`)) return false;
+  try {
+    if (sessionStorage.getItem('murmur.reloadedFor') === build) return false;
+    sessionStorage.setItem('murmur.reloadedFor', build);
+  } catch {
+    return false;
+  }
+  return true;
+}
+
 const initial: State = {
   ready: false,
   online: false,
   owner: false,
   messages: [],
-  live: null,
-  helper: { connected: false, name: 'Me', info: null },
+  lives: {},
+  helpers: [],
+  hostName: 'Me',
   polish: true,
   polishAvailable: false,
   notice: null,
   name: read('murmur.name') ?? '',
 };
 
-// Mic levels arrive ~20×/s; they go to subscribers directly instead of through React state.
+// Your own mic level arrives ~20×/s; it goes to subscribers directly instead of through React state.
 const levelListeners = new Set<(v: number) => void>();
 export function onLevel(fn: (v: number) => void) {
   levelListeners.add(fn);
@@ -98,54 +118,68 @@ export function onLevel(fn: (v: number) => void) {
 export function useMurmur() {
   const [s, setS] = useState<State>(initial);
   const ws = useRef<WebSocket | null>(null);
+  const me = useRef(clientId);
 
   useEffect(() => {
     let closed = false;
     let retry: ReturnType<typeof setTimeout>;
     let noticeTimer: ReturnType<typeof setTimeout>;
-    const token = ownerToken();
+    const token = read('murmur.owner') ?? '';
 
     const connect = () => {
       const proto = location.protocol === 'https:' ? 'wss' : 'ws';
       const sock = new WebSocket(`${proto}://${location.host}/ws${token ? `?owner=${encodeURIComponent(token)}` : ''}`);
       ws.current = sock;
       sock.onclose = () => {
-        setS((p) => ({ ...p, online: false, live: null }));
+        setS((p) => ({ ...p, online: false, lives: {} }));
         if (!closed) retry = setTimeout(connect, 1200);
       };
       sock.onmessage = (ev) => {
         const m = JSON.parse(ev.data);
-        if (m.t === 'level') return levelListeners.forEach((fn) => fn(m.v));
+        if (m.t === 'level') {
+          if (m.id === me.current) levelListeners.forEach((fn) => fn(m.v));
+          return;
+        }
         setS((p) => {
           switch (m.t) {
             case 'init':
+              if (staleBuild(m.build)) location.reload();
+              me.current = m.owner ? OWNER_ID : clientId;
               return {
                 ...p,
                 ready: true,
                 online: true,
                 owner: m.owner,
                 messages: m.messages,
-                live: m.live,
-                helper: m.helper,
+                lives: Object.fromEntries((m.lives as Live[]).map((l) => [l.senderId, l])),
+                helpers: m.helpers,
+                hostName: m.hostName,
                 polish: m.polish,
                 polishAvailable: m.polishAvailable,
               };
-            case 'live':
-              return { ...p, live: m.live };
-            case 'message':
-              return { ...p, messages: [...p.messages, m.message], live: m.endLive ? null : p.live };
+            case 'live': {
+              const lives = { ...p.lives };
+              if (m.live) lives[m.senderId] = m.live;
+              else delete lives[m.senderId];
+              return { ...p, lives };
+            }
+            case 'message': {
+              const lives = { ...p.lives };
+              if (m.endLive) delete lives[m.endLive];
+              return { ...p, messages: [...p.messages, m.message], lives };
+            }
             case 'update':
               return { ...p, messages: p.messages.map((x) => (x.id === m.message.id ? m.message : x)) };
             case 'delete':
               return { ...p, messages: p.messages.filter((x) => x.id !== m.id) };
             case 'clear':
               return { ...p, messages: [] };
-            case 'helper':
-              return { ...p, helper: { connected: m.connected, name: m.name, info: m.info } };
+            case 'helpers':
+              return { ...p, helpers: m.helpers, hostName: m.hostName };
             case 'polish':
               return { ...p, polish: m.on };
             case 'notice':
-              if (m.ownerOnly && !p.owner) return p;
+              if (m.to && m.to !== me.current) return p;
               clearTimeout(noticeTimer);
               noticeTimer = setTimeout(() => setS((q) => ({ ...q, notice: null })), 6000);
               return { ...p, notice: m.text };
@@ -168,12 +202,16 @@ export function useMurmur() {
     if (ws.current?.readyState === WebSocket.OPEN) ws.current.send(JSON.stringify(msg));
   };
 
+  const myId = s.owner ? OWNER_ID : clientId;
   return {
     ...s,
-    myName: s.owner ? s.helper.name : s.name,
-    isMine: (senderId: string) => (s.owner ? senderId === OWNER_ID : senderId === clientId),
-    toggle: () => send({ t: 'toggle' }),
-    cancel: () => send({ t: 'cancel' }),
+    myId,
+    myName: s.owner ? s.hostName : s.name,
+    myHelper: s.helpers.find((h) => h.id === myId) ?? null,
+    myLive: s.lives[myId] ?? null,
+    isMine: (senderId: string) => senderId === myId,
+    toggle: () => send({ t: 'toggle', clientId }),
+    cancel: () => send({ t: 'cancel', clientId }),
     sendText: (text: string) => send({ t: 'send', text, name: s.name, clientId }),
     remove: (id: string) => send({ t: 'delete', id, clientId }),
     clear: () => send({ t: 'clear' }),
