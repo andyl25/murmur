@@ -43,6 +43,7 @@ export type Message = {
   createdAt: number;
   durationMs?: number;
   audio?: string; // URL of the recording, for voice messages
+  words?: [string, number, number][]; // what was heard: [word, start ms, duration ms] into the recording
   polish?: 'pending' | 'done' | 'failed';
 };
 
@@ -236,7 +237,17 @@ function onHelperMessage(h: Helper, msg: any) {
       const rid = String(msg.id ?? '');
       const id = ID_RE.test(rid) && !store.messages.some((m) => m.id === rid) ? rid : newId();
       addMessage(
-        { id, text, raw: text, source: 'voice', sender: h.name, senderId: h.id, createdAt: started, durationMs: Date.now() - started },
+        {
+          id,
+          text,
+          raw: text,
+          source: 'voice',
+          sender: h.name,
+          senderId: h.id,
+          createdAt: started,
+          durationMs: Date.now() - started,
+          words: wordTimings(msg.words),
+        },
         h.id,
       );
       break;
@@ -249,6 +260,15 @@ function onHelperMessage(h: Helper, msg: any) {
       broadcast({ t: 'notice', text: String(msg.message ?? 'Dictation error'), to: h.id });
       break;
   }
+}
+
+function wordTimings(raw: unknown): Message['words'] {
+  if (!Array.isArray(raw)) return undefined;
+  const words = raw
+    .slice(0, 5000)
+    .filter((w) => Array.isArray(w) && typeof w[0] === 'string' && w[0] && Number.isFinite(w[1]) && Number.isFinite(w[2]))
+    .map((w) => [String(w[0]).slice(0, 64), Math.max(0, Math.round(w[1])), Math.max(0, Math.round(w[2]))] as [string, number, number]);
+  return words.length ? words : undefined;
 }
 
 /** A recording arrives as {t:'audio', id} then one binary frame with the .m4a bytes. */

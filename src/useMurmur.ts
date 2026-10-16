@@ -10,6 +10,7 @@ export type Message = {
   createdAt: number;
   durationMs?: number;
   audio?: string;
+  words?: [string, number, number][]; // [word, start ms, duration ms] into the recording
   polish?: 'pending' | 'done' | 'failed';
 };
 

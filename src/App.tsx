@@ -1,6 +1,6 @@
 import { ArrowUp, Check, Copy, Eye, Microphone, Sparks, Trash, WarningTriangle, Xmark } from 'iconoir-react';
 import { Pause, Play } from 'iconoir-react/solid';
-import { type ReactNode, useEffect, useLayoutEffect, useRef, useState } from 'react';
+import { type ReactNode, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
 import { Button } from '@/components/atoms/Button';
 import { Shimmer } from '@/components/atoms/Shimmer';
 import { cn } from '@/lib/utils';
@@ -321,6 +321,7 @@ function Bubble({
 }) {
   const [showRaw, setShowRaw] = useState(false);
   const [copied, setCopied] = useState(false);
+  const [playAt, setPlayAt] = useState<number | null>(null); // seconds into the recording while it plays
   const firstText = useRef(msg.text);
   const edited = msg.polish === 'done' && msg.raw !== msg.text;
   const text = showRaw && edited ? msg.raw : msg.text;
@@ -369,10 +370,14 @@ function Bubble({
             msg.audio && 'min-w-[230px]',
           )}
         >
-          {msg.audio && <VoicePlayer src={msg.audio} durationMs={msg.durationMs} mine={mine} />}
-          <span key={text} className={text !== firstText.current ? 'bubble-swap' : undefined}>
-            {text}
-          </span>
+          {msg.audio && <VoicePlayer src={msg.audio} durationMs={msg.durationMs} mine={mine} onTime={setPlayAt} />}
+          {playAt !== null && msg.words ? (
+            <KaraokeText text={text} words={msg.words} at={playAt} mine={mine} />
+          ) : (
+            <span key={text} className={text !== firstText.current ? 'bubble-swap' : undefined}>
+              {text}
+            </span>
+          )}
         </div>
       </div>
       {meta && <div className="mx-1 mt-1 mb-0.5 text-[11.5px] text-ink-3">{meta}</div>}
@@ -383,24 +388,57 @@ function Bubble({
 let playingNow: HTMLAudioElement | null = null; // one voice message plays at a time
 
 /** ▶ for a voice message's recording: play/pause, progress, time left. */
-function VoicePlayer({ src, durationMs, mine }: { src: string; durationMs?: number; mine: boolean }) {
+function VoicePlayer({
+  src,
+  durationMs,
+  mine,
+  onTime,
+}: {
+  src: string;
+  durationMs?: number;
+  mine: boolean;
+  onTime?: (seconds: number | null) => void; // every frame while playing; null when it finishes
+}) {
   const audio = useRef<HTMLAudioElement | null>(null);
+  const frame = useRef(0);
+  const onTimeRef = useRef(onTime);
+  onTimeRef.current = onTime;
   const [playing, setPlaying] = useState(false);
   const [pos, setPos] = useState(0);
   const [length, setLength] = useState((durationMs ?? 0) / 1000);
 
-  useEffect(() => () => audio.current?.pause(), []);
+  useEffect(
+    () => () => {
+      cancelAnimationFrame(frame.current);
+      audio.current?.pause();
+    },
+    [],
+  );
 
   const toggle = () => {
     let a = audio.current;
     if (!a) {
       a = new Audio(src);
-      a.onloadedmetadata = () => Number.isFinite(a!.duration) && setLength(a!.duration);
-      a.ontimeupdate = () => setPos(a!.currentTime);
-      a.onplay = () => setPlaying(true);
-      a.onpause = () => setPlaying(false);
-      a.onended = () => setPos(0);
-      audio.current = a;
+      const el = a;
+      // timeupdate only fires ~4×/s — too coarse for word highlights — so follow the playhead per frame
+      const tick = () => {
+        setPos(el.currentTime);
+        onTimeRef.current?.(el.currentTime);
+        if (!el.paused) frame.current = requestAnimationFrame(tick);
+      };
+      el.onloadedmetadata = () => Number.isFinite(el.duration) && setLength(el.duration);
+      el.onplay = () => {
+        setPlaying(true);
+        cancelAnimationFrame(frame.current);
+        frame.current = requestAnimationFrame(tick);
+      };
+      el.onpause = () => setPlaying(false);
+      el.onended = () => {
+        cancelAnimationFrame(frame.current);
+        setPos(0);
+        onTimeRef.current?.(null);
+      };
+      audio.current = el;
     }
     if (!a.paused) return a.pause();
     if (playingNow && playingNow !== a) playingNow.pause();
@@ -429,6 +467,86 @@ function VoicePlayer({ src, durationMs, mine }: { src: string; durationMs?: numb
         {clock(Math.max(0, length - pos) * 1000)}
       </span>
     </div>
+  );
+}
+
+const wordKey = (w: string) => w.toLowerCase().replace(/[^\p{L}\p{N}]/gu, '');
+
+/**
+ * Give every word of the shown (possibly cleaned-up) text a [start, end) time from the recognizer's
+ * word timings by aligning the two word lists (longest common subsequence on normalized words, so
+ * dropped "um"s still line up). Runs of heard words that the clean-up joined ("4" "30" → "4:30")
+ * count as one. A shown word with no match lights up right after the word before it.
+ */
+function timeWords(tokens: string[], heard: [string, number, number][]) {
+  const a = tokens.map(wordKey);
+  const shown = new Set(a);
+  // heard words as [key, start s, end s], merging 2–3 neighbours whose joined key is a shown word
+  const units: [string, number, number][] = [];
+  for (let j = 0; j < heard.length; ) {
+    let take = 1;
+    for (const n of [3, 2])
+      if (j + n <= heard.length) {
+        const joined = heard.slice(j, j + n).map((w) => wordKey(w[0])).join('');
+        if (shown.has(joined) && !shown.has(wordKey(heard[j][0]))) {
+          take = n;
+          break;
+        }
+      }
+    const last = heard[j + take - 1];
+    units.push([heard.slice(j, j + take).map((w) => wordKey(w[0])).join(''), heard[j][1] / 1000, (last[1] + last[2]) / 1000]);
+    j += take;
+  }
+  const b = units.map((u) => u[0]);
+  const match: number[] = new Array(a.length).fill(-1);
+  if (a.length * b.length <= 400_000) {
+    const dp = Array.from({ length: a.length + 1 }, () => new Uint16Array(b.length + 1));
+    for (let i = a.length - 1; i >= 0; i--)
+      for (let j = b.length - 1; j >= 0; j--)
+        dp[i][j] = a[i] && a[i] === b[j] ? dp[i + 1][j + 1] + 1 : Math.max(dp[i + 1][j], dp[i][j + 1]);
+    for (let i = 0, j = 0; i < a.length && j < b.length; )
+      if (a[i] && a[i] === b[j]) match[i++] = j++;
+      else if (dp[i + 1][j] >= dp[i][j + 1]) i++;
+      else j++;
+  } else {
+    for (let i = 0; i < a.length; i++) match[i] = Math.floor((i * b.length) / a.length); // too long to align: spread evenly
+  }
+  const starts: number[] = [];
+  let prevEnd = 0;
+  for (let i = 0; i < a.length; i++) {
+    const u = match[i] >= 0 ? units[match[i]] : null;
+    starts.push(u ? u[1] : prevEnd);
+    if (u) prevEnd = u[2];
+  }
+  const end = units.length ? units[units.length - 1][2] + 0.3 : 0;
+  // a word stays lit until the next one starts, so short gaps don't flicker
+  return starts.map((start, i) => ({ start, end: Math.max(start, starts.find((t, k) => k > i && t > start) ?? end) }));
+}
+
+/** The message text with each word lit as it's spoken in the recording. */
+function KaraokeText({ text, words, at, mine }: { text: string; words: [string, number, number][]; at: number; mine: boolean }) {
+  const parts = useMemo(() => text.split(/(\s+)/), [text]);
+  const times = useMemo(() => timeWords(parts.filter((_, i) => i % 2 === 0), words), [parts, words]);
+  return (
+    <span>
+      {parts.map((part, i) => {
+        if (i % 2) return part; // whitespace
+        const t = times[i / 2];
+        const state = at >= t.end ? 'said' : at >= t.start ? 'now' : 'next';
+        return (
+          <span
+            key={i}
+            className={cn(
+              '-mx-[2px] rounded-[4px] px-[2px] transition-[opacity,background-color] duration-100',
+              state === 'next' && 'opacity-45',
+              state === 'now' && (mine ? 'bg-white/30' : 'bg-accent/20'),
+            )}
+          >
+            {part}
+          </span>
+        );
+      })}
+    </span>
   );
 }
 

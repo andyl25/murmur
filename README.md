@@ -1,6 +1,6 @@
 # Murmur
 
-Wispr Flow–style voice chat. Tap **fn** anywhere on your Mac and talk: your words stream live into a shared chat at **https://copose.ai** as you speak. Tap **fn** again to send. **Esc** discards. Every voice message also keeps its recording, so anyone in the chat can tap ▶ to hear it.
+Wispr Flow–style voice chat. Tap **fn** anywhere on your Mac and talk: your words stream live into a shared chat at **https://copose.ai** as you speak. Tap **fn** again to send. **Esc** discards. Every voice message also keeps its recording: anyone in the chat can tap ▶ to hear it, and each word lights up as it’s spoken.
 
 ```
 fn ─▶ Murmur.app (menu bar)             server (copose.ai)                      web chat

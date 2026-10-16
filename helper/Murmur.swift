@@ -181,6 +181,11 @@ final class Dictation {
     private var session = 0
     private var committed = "" // text from earlier recognition segments of this dictation
     private var current = ""
+    // Word timings (seconds into the recording) for karaoke highlighting on playback, kept in
+    // step with committed/current. audioIn = seconds of audio fed so far (under requestLock).
+    private var committedWords: [Word] = []
+    private var currentWords: [Word] = []
+    private var audioIn: Double = 0
     private var lastHadMetadata = false
     private var restarts: [CFTimeInterval] = []
     private var finishing: ((String) -> Void)?
@@ -198,7 +203,10 @@ final class Dictation {
         recognizer.defaultTaskHint = .dictation
     }
 
+    struct Word { let text: String; let start: Double; let duration: Double }
+
     var onDevice: Bool { recognizer.supportsOnDeviceRecognition }
+    var words: [Word] { committedWords + currentWords }
     var text: String { join(committed, current) }
 
     // The recording people can play back: AAC in a temp .m4a, written from the same buffers
@@ -281,6 +289,7 @@ final class Dictation {
         requestLock.lock()
         request?.append(buffer)
         try? recorder?.write(from: buffer)
+        audioIn += Double(buffer.frameLength) / buffer.format.sampleRate
         requestLock.unlock()
         guard let ch = buffer.floatChannelData?[0], buffer.frameLength > 0 else { return }
         var sum: Float = 0
@@ -294,6 +303,11 @@ final class Dictation {
         session += 1
         committed = ""
         current = ""
+        committedWords = []
+        currentWords = []
+        requestLock.lock()
+        audioIn = 0
+        requestLock.unlock()
         lastHadMetadata = false
         restarts = []
         finishing = nil
@@ -308,22 +322,32 @@ final class Dictation {
         if recognizer.supportsOnDeviceRecognition { req.requiresOnDeviceRecognition = true }
         requestLock.lock()
         request = req
+        let offset = audioIn // a restarted task's timestamps count from its own first buffer
         requestLock.unlock()
         let s = session
         task = recognizer.recognitionTask(with: req) { [weak self] result, error in
-            DispatchQueue.main.async { self?.handle(result, error, s) }
+            DispatchQueue.main.async { self?.handle(result, error, s, offset) }
         }
     }
 
-    private func handle(_ result: SFSpeechRecognitionResult?, _ error: Error?, _ s: Int) {
+    private func handle(_ result: SFSpeechRecognitionResult?, _ error: Error?, _ s: Int, _ offset: Double) {
         guard s == session else { return }
         if let result {
             let t = result.bestTranscription.formattedString
             if verbose {
                 log("result final=\(result.isFinal) meta=\(result.speechRecognitionMetadata != nil) stopping=\(finishing != nil) text=\"\(t)\"")
             }
-            if looksLikeReset(t) { committed = join(committed, current) }
+            if looksLikeReset(t) {
+                committed = join(committed, current)
+                committedWords += currentWords
+            }
             current = t
+            currentWords = result.bestTranscription.segments.filter { !$0.substring.isEmpty }.map {
+                Word(text: $0.substring, start: offset + $0.timestamp, duration: $0.duration)
+            }
+            if verbose, result.speechRecognitionMetadata != nil || result.isFinal {
+                log("  words: " + currentWords.map { String(format: "%@@%.2f+%.2f", $0.text, $0.start, $0.duration) }.joined(separator: " "))
+            }
             lastHadMetadata = result.speechRecognitionMetadata != nil
             onPartial?(text)
             if result.isFinal { return segmentEnded() }
@@ -345,6 +369,8 @@ final class Dictation {
         guard active else { return }
         committed = join(committed, current)
         current = ""
+        committedWords += currentWords
+        currentWords = []
         let now = CACurrentMediaTime()
         restarts = restarts.filter { now - $0 < 3 } + [now]
         if restarts.count > 3 {
@@ -649,7 +675,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     @discardableResult
     func sendFinal(id: String, text: String) -> Int {
         let audio = dictation.takeRecording()
-        link.send(["t": "final", "id": id, "text": text])
+        // [word, start ms, duration ms] so the chat can highlight each word as the recording plays
+        let words = dictation.words.map { [$0.text, Int($0.start * 1000), Int($0.duration * 1000)] as [Any] }
+        link.send(["t": "final", "id": id, "text": text, "words": words])
         guard !text.isEmpty, let audio, !audio.isEmpty else { return 0 }
         link.send(["t": "audio", "id": id])
         link.sendData(audio)
